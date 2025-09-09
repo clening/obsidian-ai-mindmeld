@@ -209,7 +209,7 @@ Enable debug logging in the plugin settings to see detailed processing informati
 - [x] Interactive tree view
 
 ### Phase 2 (Planned)
-- [ ] Visual mindmap rendering (using Markmap/D3.js)
+- [x] Visual mindmap rendering (using Markmap/D3.js)
 - [ ] Image export functionality
 - [ ] Real-time mindmap updates when notes change
 - [ ] Custom prompt templates
@@ -219,6 +219,12 @@ Enable debug logging in the plugin settings to see detailed processing informati
 - [ ] Knowledge graph generation
 - [ ] Integration with other mindmap plugins
 - [ ] Mobile app support
+
+## Known issues
+- [ ] WHen combining mindmaps, the combination does not always maintain the STEEPLE structure, and often will regroup child categories in the wrong STEEPLE category.
+- [ ] Formatting in the MD file gets confused when merging and adds links as ##s instead of *s
+- [ ] The source view of the original mindmap generation has a horizontal spread that continues to persist, despite NUMEROUS edits to the GUI -- it's some sort of SVG rendering issue. I fix it, and then it goes back to sucking every time Claude Code makes an update
+- [ ] Saved MD mindmaps only create *s not ##s, and link associations fail.   
 
 ## Contributing
 
