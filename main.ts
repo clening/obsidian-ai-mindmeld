@@ -7,6 +7,7 @@ import { MindmapPersistenceService } from './src/services/mindmapPersistence';
 import { SourceSelectorModal } from './src/components/sourceSelectorModal';
 import { MindmapView, VIEW_TYPE_MINDMAP } from './src/components/mindmapView';
 import { VisualMindmapView, VIEW_TYPE_VISUAL_MINDMAP } from './src/components/visualMindmapView';
+import { MindmapCombinerModal } from './src/components/mindmapCombinerModal';
 
 const DEFAULT_SETTINGS: PluginSettings = {
   llmProvider: 'claude',
@@ -58,6 +59,11 @@ export default class AIMindmapPlugin extends Plugin {
       this.openSourceSelector();
     });
 
+    // Add combine mindmaps ribbon icon
+    const combineRibbonEl = this.addRibbonIcon('link', 'Combine Mindmaps', (evt: MouseEvent) => {
+      this.openMindmapCombiner();
+    });
+
     // Add commands
     this.addCommand({
       id: 'generate-mindmap-from-selection',
@@ -88,6 +94,14 @@ export default class AIMindmapPlugin extends Plugin {
       name: 'Open visual mindmap view',
       callback: () => {
         this.activateVisualMindmapView();
+      }
+    });
+
+    this.addCommand({
+      id: 'combine-mindmaps',
+      name: 'Combine multiple mindmaps',
+      callback: () => {
+        this.openMindmapCombiner();
       }
     });
 
@@ -143,6 +157,28 @@ export default class AIMindmapPlugin extends Plugin {
   async openTagSelector() {
     // This will be implemented in Phase 2
     new Notice('Tag selector coming in next version!');
+  }
+
+  async openMindmapCombiner() {
+    try {
+      console.log('Opening mindmap combiner modal...');
+      
+      // First check if we have any saved mindmaps
+      const savedMindmaps = await this.persistenceService.getAllMindmaps();
+      console.log(`Found ${savedMindmaps.length} saved mindmaps`);
+      
+      if (savedMindmaps.length < 2) {
+        new Notice('You need at least 2 saved mindmaps to combine. Generate more mindmaps first!');
+        return;
+      }
+      
+      const modal = new MindmapCombinerModal(this.app, this);
+      modal.open();
+      console.log('Mindmap combiner modal opened successfully');
+    } catch (error) {
+      console.error('Failed to open mindmap combiner:', error);
+      new Notice(`Failed to open mindmap combiner: ${error.message}`);
+    }
   }
 
   async generateMindmapFromSelection(selection: SourceSelection) {
