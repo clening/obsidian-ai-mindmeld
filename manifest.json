@@ -2,7 +2,6 @@
   "id": "ai-mindmeld",
   "name": "Mindmeld: An AI-based Mindmap Generator",
   "version": "1.0.0",
-  "minAppVersion": "0.15.0",
   "description": "Generate intelligent mindmaps from your notes using AI analysis. Incorporates existing tags and creates multi-dimensional knowledge visualizations.",
   "author": "Carey Lening",
   "authorUrl": "https://github.com/clening",
