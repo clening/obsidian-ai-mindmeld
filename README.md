@@ -1,6 +1,6 @@
-# AI Mindmap Generator for Obsidian
+# AI-Enhanced Mindmap Generator for Obsidian
 
-An intelligent mindmap plugin that automatically generates hierarchical knowledge visualizations from your Obsidian notes using AI analysis. Combines the power of LLMs (Claude, GPT) with existing tag structures to create meaningful knowledge maps.
+Mindmeld is an intelligent mindmap plugin that automatically generates hierarchical knowledge visualizations from your Obsidian notes using AI analysis. Combines the power of LLMs (Claude, ChatGPT) with existing tag structures to create meaningful knowledge maps.
 
 ## Features
 
