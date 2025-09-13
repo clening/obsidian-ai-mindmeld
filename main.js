@@ -297,7 +297,7 @@ var LLMService = class {
   }
   buildMindmapPrompt(processedContent, allTags, context) {
     const tagWeightingInstructions = this.getTagWeightingInstructions();
-    const multiParentInstructions = this.settings.enableMultiParent ? "\n- Create cross-connections where content relates to multiple STEEPLE categories using [ALSO: Parent Category] notation" : "";
+    const categorizationInstructions = this.getCategorizationInstructions();
     const contentSummary = processedContent.map(
       (content) => `**${content.title}** (Tags: ${content.tags.join(", ")})
 ${content.content.substring(0, 300)}...`
@@ -315,8 +315,8 @@ INSTRUCTIONS:
 - Include only STEEPLE categories that have relevant content
 - Create 2-3 subcategories under each main category
 - Put specific topics under subcategories
-- Use existing user tags where relevant${multiParentInstructions}
-- For topics that span multiple STEEPLE areas, add [ALSO: CategoryName] to show cross-connections
+- Use existing user tags where relevant
+${categorizationInstructions}
 
 REQUIRED OUTPUT FORMAT (copy this structure exactly):
 
@@ -331,7 +331,7 @@ REQUIRED OUTPUT FORMAT (copy this structure exactly):
 # Technological  
 - Innovation & AI
   - Emerging technologies
-  - AI governance [ALSO: Ethical]
+  - AI systems
 - Digital Transformation
   - Platform technologies  
   - Data systems
@@ -394,6 +394,13 @@ IMPORTANT:
       default:
         return "";
     }
+  }
+  getCategorizationInstructions() {
+    return `- IMPORTANT: Choose the PRIMARY/STRONGEST STEEPLE category for each topic
+- Place each topic in its SINGLE MOST RELEVANT category only
+- DO NOT use [ALSO: CategoryName] notation - no cross-connections
+- Avoid over-categorization - focus on the most logical placement
+- If a topic could fit multiple categories, choose the ONE that is most central to the topic's core nature`;
   }
   buildTagHierarchy(tags) {
     const hierarchy = {};
@@ -662,17 +669,68 @@ var MindmapGenerator = class {
     };
   }
   enrichNodesWithContent(nodes, processedContent) {
-    const contentIndex = this.buildContentSearchIndex(processedContent);
+    const contentAssignments = this.assignContentToNodes(nodes, processedContent);
     return nodes.map((node) => {
-      const relevantContent = this.findRelevantContent(node.label, contentIndex, processedContent);
+      const assignedContent = contentAssignments.get(node.id) || [];
+      const relevantTags = [...new Set(assignedContent.flatMap((content) => content.tags))];
+      const summary = this.generateContentSummaryFromAssigned(assignedContent, node.label);
       return {
         ...node,
-        content: relevantContent.summary || node.label,
-        sourceNotes: relevantContent.sourceFiles,
-        tags: [.../* @__PURE__ */ new Set([...node.tags, ...relevantContent.tags])]
-        // Merge tags
+        content: summary || node.label,
+        sourceNotes: assignedContent.map((content) => content.filePath),
+        tags: [.../* @__PURE__ */ new Set([...node.tags, ...relevantTags])]
       };
     });
+  }
+  assignContentToNodes(nodes, processedContent) {
+    const assignments = /* @__PURE__ */ new Map();
+    const usedContent = /* @__PURE__ */ new Set();
+    nodes.forEach((node) => assignments.set(node.id, []));
+    processedContent.forEach((content) => {
+      if (usedContent.has(content.filePath))
+        return;
+      let bestMatch = null;
+      nodes.forEach((node) => {
+        const score = this.calculateNodeContentMatch(node, content);
+        if (!bestMatch || score > bestMatch.score) {
+          bestMatch = { node, score };
+        }
+      });
+      if (bestMatch && bestMatch.score > 0) {
+        assignments.get(bestMatch.node.id).push(content);
+        usedContent.add(content.filePath);
+        console.log(`Assigned "${content.title}" to node "${bestMatch.node.label}" (score: ${bestMatch.score})`);
+      }
+    });
+    return assignments;
+  }
+  calculateNodeContentMatch(node, content) {
+    const nodeKeywords = this.extractKeywords(node.label);
+    const contentKeywords = this.extractKeywords(content.title + " " + content.content);
+    const overlap = nodeKeywords.filter((keyword) => contentKeywords.includes(keyword));
+    const overlapRatio = overlap.length / Math.max(nodeKeywords.length, 1);
+    const hierarchyBoost = node.level * 0.1;
+    const tagMatches = node.tags.filter((tag) => content.tags.includes(tag)).length;
+    const tagBoost = tagMatches * 0.2;
+    return overlapRatio + hierarchyBoost + tagBoost;
+  }
+  generateContentSummaryFromAssigned(assignedContent, nodeLabel) {
+    if (assignedContent.length === 0) {
+      return nodeLabel;
+    }
+    const keywords = this.extractKeywords(nodeLabel);
+    const relevantSentences = [];
+    assignedContent.forEach((content) => {
+      const sentences = content.content.split(/[.!?]+/);
+      sentences.forEach((sentence) => {
+        const sentenceKeywords = this.extractKeywords(sentence);
+        const keywordOverlap = keywords.filter((k) => sentenceKeywords.includes(k));
+        if (keywordOverlap.length > 0) {
+          relevantSentences.push(sentence.trim());
+        }
+      });
+    });
+    return relevantSentences.length > 0 ? relevantSentences[0].substring(0, 150) + "..." : nodeLabel;
   }
   buildContentSearchIndex(processedContent) {
     const index = /* @__PURE__ */ new Map();
@@ -1131,7 +1189,32 @@ var MindmapPersistenceService = class {
       const name = frontmatter.title || file.name.replace(".md", "");
       const createdAt = frontmatter.created || frontmatter.created_at || ((_a = file.stat) == null ? void 0 : _a.ctime) ? new Date(file.stat.ctime).toISOString() : new Date().toISOString();
       const modifiedAt = frontmatter.modified || frontmatter.modified_at || ((_b = file.stat) == null ? void 0 : _b.mtime) ? new Date(file.stat.mtime).toISOString() : new Date().toISOString();
-      const structure = this.parseMarkdownToStructure(body);
+      let structure;
+      let foundInMemory = false;
+      if (this.library.savedMindmaps[mindmapId]) {
+        console.log(`Using original structure from memory for ${name} (exact ID match)`);
+        structure = this.library.savedMindmaps[mindmapId].structure;
+        foundInMemory = true;
+      } else {
+        const nameMatch = Object.values(this.library.savedMindmaps).find((m) => m.name === name);
+        if (nameMatch) {
+          console.log(`Using original structure from memory for ${name} (name match)`);
+          structure = nameMatch.structure;
+          foundInMemory = true;
+        } else {
+          const pathMatch = Object.values(this.library.savedMindmaps).find(
+            (m) => m.sourceFiles.some((sf) => sf.includes(file.name.replace(".md", "")))
+          );
+          if (pathMatch) {
+            console.log(`Using original structure from memory for ${name} (path match)`);
+            structure = pathMatch.structure;
+            foundInMemory = true;
+          } else {
+            console.warn(`No memory match found for ${name} - parsing from markdown may lose semantic relationships`);
+            structure = this.parseMarkdownToStructure(body);
+          }
+        }
+      }
       const savedMindmap = {
         id: mindmapId,
         name,
@@ -1686,6 +1769,7 @@ title: "${mindmap.name}"
 created: "${mindmap.createdAt}"
 modified: "${mindmap.modifiedAt}"
 tags: [ai-mindmap, auto-generated, ${mindmap.metadata.steepleCategories.map((c) => c.toLowerCase()).join(", ")}]
+mindmap-plugin: basic
 mindmap-id: "${mindmap.id}"
 source-count: ${mindmap.sourceCount}
 llm-provider: "${mindmap.metadata.llmProvider}"
@@ -3298,7 +3382,7 @@ var SaveMindmapModal = class extends import_obsidian5.Modal {
     }
     try {
       console.log("SaveMindmapModal: Looking for plugin instance...");
-      const plugin = this.app.plugins.plugins["ai-mindmap-generator"];
+      const plugin = this.app.plugins.plugins["ai-mindmeld"];
       console.log("SaveMindmapModal: Plugin found:", !!plugin);
       console.log("SaveMindmapModal: Plugin type:", typeof plugin);
       if (plugin) {
