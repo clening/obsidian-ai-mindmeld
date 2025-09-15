@@ -971,9 +971,12 @@ markmap:
 
 // src/services/mindmapPersistence.ts
 var MindmapPersistenceService = class {
-  constructor(app, plugin) {
+  // Will be injected
+  constructor(app, plugin, llmService) {
+    this.similarityCache = /* @__PURE__ */ new Map();
     this.app = app;
     this.plugin = plugin;
+    this.llmService = llmService;
     this.library = {
       savedMindmaps: {},
       combineHistory: [],
@@ -1414,10 +1417,10 @@ var MindmapPersistenceService = class {
     let nodeIdCounter = Math.max(...combinedNodes.map((n) => parseInt(n.id.split("_")[1]) || 0)) + 1;
     for (let i = 1; i < mindmaps.length; i++) {
       const currentMindmap = mindmaps[i];
-      for (const newNode of currentMindmap.structure.nodes) {
-        const existingNode = combinedNodes.find(
-          (existing) => this.areNodesSimilar(existing, newNode, options)
-        );
+      const newNodes = currentMindmap.structure.nodes;
+      const duplicatesMap = await this.findDuplicatesBatch(combinedNodes, newNodes, options);
+      for (const newNode of newNodes) {
+        const existingNode = duplicatesMap.get(newNode.id);
         if (existingNode && (options.conflictResolutionStrategy === "exact_match" /* EXACT_MATCH */ || options.conflictResolutionStrategy === "semantic_similarity" /* SEMANTIC_SIMILARITY */)) {
           this.mergeNodeData(existingNode, newNode, options);
         } else {
@@ -1447,21 +1450,39 @@ var MindmapPersistenceService = class {
     };
     return combinedStructure;
   }
-  areNodesSimilar(node1, node2, options) {
+  async areNodesSimilar(node1, node2, options) {
     if (options.conflictResolutionStrategy === "exact_match" /* EXACT_MATCH */) {
       return node1.label.toLowerCase().trim() === node2.label.toLowerCase().trim();
     } else if (options.conflictResolutionStrategy === "semantic_similarity" /* SEMANTIC_SIMILARITY */) {
-      const similarity = this.calculateSemanticSimilarity(node1.label, node2.label);
+      const similarity = await this.calculateSemanticSimilarity(node1.label, node2.label);
       return similarity >= options.maxSimilarityThreshold;
     }
     return false;
   }
-  calculateSemanticSimilarity(text1, text2) {
+  async calculateSemanticSimilarity(text1, text2) {
+    const cacheKey = this.getSimilarityCacheKey(text1, text2);
+    if (this.similarityCache.has(cacheKey)) {
+      return this.similarityCache.get(cacheKey);
+    }
     const normalize = (text) => text.toLowerCase().trim().replace(/[^\w\s]/g, "");
     const norm1 = normalize(text1);
     const norm2 = normalize(text2);
-    if (norm1 === norm2)
+    if (norm1 === norm2) {
+      this.similarityCache.set(cacheKey, 1);
       return 1;
+    }
+    const basicSimilarity = this.calculateBasicSimilarity(norm1, norm2);
+    try {
+      const llmSimilarity = await this.calculateLLMSemanticSimilarity(text1, text2);
+      this.similarityCache.set(cacheKey, llmSimilarity);
+      return llmSimilarity;
+    } catch (error) {
+      console.warn("LLM semantic similarity failed, using basic similarity:", error);
+      this.similarityCache.set(cacheKey, basicSimilarity);
+      return basicSimilarity;
+    }
+  }
+  calculateBasicSimilarity(norm1, norm2) {
     const words1 = new Set(norm1.split(/\s+/).filter((w) => w.length > 2));
     const words2 = new Set(norm2.split(/\s+/).filter((w) => w.length > 2));
     const intersection = new Set([...words1].filter((w) => words2.has(w)));
@@ -1471,6 +1492,177 @@ var MindmapPersistenceService = class {
     const jaccardSim = intersection.size / union.size;
     const stringSim = this.calculateStringSimilarity(norm1, norm2);
     return jaccardSim * 0.7 + stringSim * 0.3;
+  }
+  async calculateLLMSemanticSimilarity(text1, text2) {
+    if (!this.llmService) {
+      throw new Error("LLM service not available for semantic similarity");
+    }
+    const prompt = `Rate the semantic similarity between these two concepts on a scale of 0.0 to 1.0:
+
+Concept A: "${text1}"
+Concept B: "${text2}"
+
+Scale:
+0.0 = Completely unrelated concepts
+0.3 = Loosely related (same broad domain)  
+0.6 = Related but distinct concepts
+0.8 = Very similar concepts
+1.0 = Essentially the same concept
+
+Consider:
+- Conceptual meaning, not just word overlap
+- Domain relationships (e.g., "Data Privacy" and "Information Security" are related)
+- Hierarchical relationships (e.g., "Machine Learning" is part of "AI Technology")
+
+Return only a single number between 0.0 and 1.0:`;
+    try {
+      const response = await this.llmService.makeAPICall(prompt, [], 100);
+      if (response.success) {
+        const similarityText = response.structure.trim();
+        const similarity = parseFloat(similarityText);
+        if (isNaN(similarity) || similarity < 0 || similarity > 1) {
+          console.warn(`Invalid LLM similarity response: ${similarityText}`);
+          throw new Error("Invalid similarity score from LLM");
+        }
+        console.log(`LLM Semantic Similarity: "${text1}" vs "${text2}" = ${similarity}`);
+        return similarity;
+      } else {
+        throw new Error(response.error || "LLM API call failed");
+      }
+    } catch (error) {
+      console.error("LLM semantic similarity error:", error);
+      throw error;
+    }
+  }
+  getSimilarityCacheKey(text1, text2) {
+    const [a, b] = [text1.toLowerCase().trim(), text2.toLowerCase().trim()].sort();
+    return `${a}|||${b}`;
+  }
+  async findDuplicatesBatch(existingNodes, newNodes, options) {
+    const duplicatesMap = /* @__PURE__ */ new Map();
+    if (options.conflictResolutionStrategy === "exact_match" /* EXACT_MATCH */) {
+      for (const newNode of newNodes) {
+        const existing = existingNodes.find(
+          (e) => e.label.toLowerCase().trim() === newNode.label.toLowerCase().trim()
+        );
+        if (existing) {
+          duplicatesMap.set(newNode.id, existing);
+        }
+      }
+      return duplicatesMap;
+    }
+    if (options.conflictResolutionStrategy !== "semantic_similarity" /* SEMANTIC_SIMILARITY */) {
+      return duplicatesMap;
+    }
+    const candidates = this.getSemanticCandidates(existingNodes, newNodes);
+    console.log(`Semantic similarity: ${candidates.length} candidate pairs (filtered from ${existingNodes.length * newNodes.length})`);
+    if (candidates.length === 0) {
+      return duplicatesMap;
+    }
+    await this.processSimilarityCandidatesBatch(candidates, options, duplicatesMap);
+    return duplicatesMap;
+  }
+  getSemanticCandidates(existingNodes, newNodes) {
+    const candidates = [];
+    const steepleCategories = ["Social", "Technological", "Economic", "Environmental", "Political", "Legal", "Ethical"];
+    for (const newNode of newNodes) {
+      const relevantExisting = existingNodes.filter((existing) => {
+        if (Math.abs(existing.level - newNode.level) <= 1) {
+          return true;
+        }
+        if (existing.level === 0 && newNode.level === 0) {
+          return steepleCategories.includes(existing.label) && steepleCategories.includes(newNode.label);
+        }
+        return false;
+      });
+      for (const existing of relevantExisting) {
+        const basicSim = this.calculateBasicSimilarity(
+          existing.label.toLowerCase().trim(),
+          newNode.label.toLowerCase().trim()
+        );
+        if (basicSim >= 0.1) {
+          candidates.push({ existing, newNode });
+        }
+      }
+    }
+    return candidates;
+  }
+  async processSimilarityCandidatesBatch(candidates, options, duplicatesMap) {
+    const BATCH_SIZE = 5;
+    for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+      const batch = candidates.slice(i, i + BATCH_SIZE);
+      try {
+        const similarities = await this.calculateBatchSemanticSimilarity(batch);
+        for (let j = 0; j < batch.length; j++) {
+          const candidate = batch[j];
+          const similarity = similarities[j];
+          if (similarity >= options.maxSimilarityThreshold) {
+            console.log(`Found semantic duplicate: "${candidate.existing.label}" \u2248 "${candidate.newNode.label}" (${similarity})`);
+            if (!duplicatesMap.has(candidate.newNode.id)) {
+              duplicatesMap.set(candidate.newNode.id, candidate.existing);
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Batch semantic similarity failed:", error);
+        for (const candidate of batch) {
+          try {
+            const similarity = await this.calculateSemanticSimilarity(
+              candidate.existing.label,
+              candidate.newNode.label
+            );
+            if (similarity >= options.maxSimilarityThreshold && !duplicatesMap.has(candidate.newNode.id)) {
+              duplicatesMap.set(candidate.newNode.id, candidate.existing);
+            }
+          } catch (individualError) {
+            console.warn(`Individual similarity check failed for "${candidate.existing.label}" vs "${candidate.newNode.label}"`);
+          }
+        }
+      }
+    }
+  }
+  async calculateBatchSemanticSimilarity(candidates) {
+    if (!this.llmService || candidates.length === 0) {
+      throw new Error("LLM service not available or no candidates");
+    }
+    const pairs = candidates.map(
+      (c, i) => `${i + 1}. "${c.existing.label}" vs "${c.newNode.label}"`
+    ).join("\n");
+    const prompt = `Rate the semantic similarity between these concept pairs on a scale of 0.0 to 1.0:
+
+${pairs}
+
+Scale:
+0.0 = Completely unrelated concepts
+0.3 = Loosely related (same broad domain)
+0.6 = Related but distinct concepts  
+0.8 = Very similar concepts
+1.0 = Essentially the same concept
+
+Consider conceptual meaning, domain relationships, and hierarchical connections.
+
+Return only a JSON array with ${candidates.length} numbers:
+Example: [0.2, 0.8, 0.1, 0.9, 0.3]`;
+    try {
+      const response = await this.llmService.makeAPICall(prompt, [], 200);
+      if (response.success) {
+        const responseText = response.structure.trim();
+        console.log("Batch similarity response:", responseText);
+        const jsonMatch = responseText.match(/\[([\d\.\,\s]+)\]/);
+        if (jsonMatch) {
+          const similarities = JSON.parse(jsonMatch[0]);
+          if (Array.isArray(similarities) && similarities.length === candidates.length) {
+            return similarities.map((s) => parseFloat(s)).filter((s) => !isNaN(s));
+          }
+        }
+        throw new Error("Invalid batch similarity response format");
+      } else {
+        throw new Error(response.error || "Batch LLM API call failed");
+      }
+    } catch (error) {
+      console.error("Batch semantic similarity error:", error);
+      throw error;
+    }
   }
   calculateStringSimilarity(str1, str2) {
     const maxLen = Math.max(str1.length, str2.length);
@@ -3768,7 +3960,7 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
     this.contentAggregator = new ContentAggregator(this.app);
     this.llmService = new LLMService(this.settings);
     this.mindmapGenerator = new MindmapGenerator();
-    this.persistenceService = new MindmapPersistenceService(this.app, this);
+    this.persistenceService = new MindmapPersistenceService(this.app, this, this.llmService);
     await this.persistenceService.initialize();
     this.registerView(
       VIEW_TYPE_MINDMAP,
