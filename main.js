@@ -1282,6 +1282,8 @@ var MindmapPersistenceService = class {
       const lines = markdown.split("\n");
       const nodeMap = /* @__PURE__ */ new Map();
       const rootNodes = [];
+      let currentNode = null;
+      console.log("Parsing markdown to structure with FIXED parser...");
       for (const line of lines) {
         const trimmedLine = line.trim();
         if (!trimmedLine || trimmedLine.startsWith("```"))
@@ -1304,39 +1306,49 @@ var MindmapPersistenceService = class {
           };
           nodes.push(node);
           nodeMap.set(nodeId, node);
+          currentNode = node;
           if (level === 0) {
             rootNodes.push(nodeId);
           }
         } else if (listMatch) {
-          const indent = listMatch[1].length;
-          const level = Math.floor(indent / 2) + 1;
-          const label = listMatch[2].replace(/^\*\*|\*\*$/g, "");
-          const nodeId = this.generateId();
-          const node = {
-            id: nodeId,
-            label,
-            content: "",
-            parents: [],
-            children: [],
-            tags: [],
-            sourceNotes: [],
-            level
-          };
-          nodes.push(node);
-          nodeMap.set(nodeId, node);
+          const content = listMatch[2].replace(/^\*\*|\*\*$/g, "");
+          if (content.match(/^\[\[.*\]\]$/)) {
+            if (currentNode) {
+              currentNode.sourceNotes.push(content);
+              console.log(`Added source to "${currentNode.label}": "${content}"`);
+            }
+          } else {
+            const indent = listMatch[1].length;
+            const level = Math.floor(indent / 2) + 1;
+            const nodeId = this.generateId();
+            const node = {
+              id: nodeId,
+              label: content,
+              content: "",
+              parents: [],
+              children: [],
+              tags: [],
+              sourceNotes: [],
+              level
+            };
+            nodes.push(node);
+            nodeMap.set(nodeId, node);
+            currentNode = node;
+          }
         }
       }
       for (let i = 0; i < nodes.length; i++) {
-        const currentNode = nodes[i];
+        const currentNode2 = nodes[i];
         for (let j = i - 1; j >= 0; j--) {
           const potentialParent = nodes[j];
-          if (potentialParent.level < currentNode.level) {
-            currentNode.parents.push(potentialParent.id);
-            potentialParent.children.push(currentNode.id);
+          if (potentialParent.level < currentNode2.level) {
+            currentNode2.parents.push(potentialParent.id);
+            potentialParent.children.push(currentNode2.id);
             break;
           }
         }
       }
+      console.log(`Parsed markdown: ${nodes.length} nodes, ${rootNodes.length} roots`);
       return {
         nodes,
         rootNodes,
@@ -1344,7 +1356,7 @@ var MindmapPersistenceService = class {
           generatedAt: new Date().toISOString(),
           sourceCount: 0,
           tagCount: 0,
-          llmProvider: "file-parser",
+          llmProvider: "fixed-file-parser",
           model: "markdown-parser"
         }
       };
@@ -1411,43 +1423,46 @@ var MindmapPersistenceService = class {
     }
   }
   async performStructureMerge(mindmaps, options) {
-    console.log("Performing structure merge...");
-    const baseMindmap = mindmaps[0];
-    let combinedNodes = [...baseMindmap.structure.nodes];
-    let nodeIdCounter = Math.max(...combinedNodes.map((n) => parseInt(n.id.split("_")[1]) || 0)) + 1;
-    for (let i = 1; i < mindmaps.length; i++) {
-      const currentMindmap = mindmaps[i];
-      const newNodes = currentMindmap.structure.nodes;
-      const duplicatesMap = await this.findDuplicatesBatch(combinedNodes, newNodes, options);
-      for (const newNode of newNodes) {
-        const existingNode = duplicatesMap.get(newNode.id);
-        if (existingNode && (options.conflictResolutionStrategy === "exact_match" /* EXACT_MATCH */ || options.conflictResolutionStrategy === "semantic_similarity" /* SEMANTIC_SIMILARITY */)) {
-          this.mergeNodeData(existingNode, newNode, options);
-        } else {
-          const adjustedNode = {
-            ...newNode,
+    console.log("Performing path-preserving structure merge...");
+    const allPaths = /* @__PURE__ */ new Map();
+    const allNodes = [];
+    let nodeIdCounter = 1;
+    for (const mindmap of mindmaps) {
+      console.log(`Processing mindmap: ${mindmap.name} with ${mindmap.structure.nodes.length} nodes`);
+      const paths = this.extractAllPaths(mindmap.structure);
+      console.log(`Extracted ${paths.size} unique paths from ${mindmap.name}`);
+      for (const [pathString, node] of paths) {
+        if (!allPaths.has(pathString)) {
+          const newNode = {
+            ...node,
             id: `node_${nodeIdCounter++}`,
             parents: [],
-            // Will be rebuilt
             children: []
-            // Will be rebuilt
           };
-          combinedNodes.push(adjustedNode);
+          allPaths.set(pathString, newNode);
+          allNodes.push(newNode);
+          console.log(`Added new path: ${pathString}`);
+        } else {
+          const existingNode = allPaths.get(pathString);
+          this.mergeNodeData(existingNode, node, options);
+          console.log(`Merged data for path: ${pathString}`);
         }
       }
     }
-    combinedNodes = this.rebuildSteepleHierarchy(combinedNodes);
+    console.log(`Total unique paths after merging: ${allPaths.size}`);
+    this.rebuildRelationshipsFromPaths(allNodes, allPaths);
     const combinedStructure = {
-      nodes: combinedNodes,
-      rootNodes: combinedNodes.filter((node) => node.level === 0).map((node) => node.id),
+      nodes: allNodes,
+      rootNodes: allNodes.filter((node) => node.level === 0).map((node) => node.id),
       metadata: {
         generatedAt: new Date().toISOString(),
         sourceCount: mindmaps.reduce((sum, m) => sum + m.sourceCount, 0),
-        tagCount: new Set(combinedNodes.flatMap((n) => n.tags)).size,
+        tagCount: new Set(allNodes.flatMap((n) => n.tags)).size,
         llmProvider: "combined",
         model: "multiple"
       }
     };
+    console.log(`Final combined structure: ${allNodes.length} nodes, ${combinedStructure.rootNodes.length} roots`);
     return combinedStructure;
   }
   async areNodesSimilar(node1, node2, options) {
@@ -1872,6 +1887,73 @@ Example: [0.2, 0.8, 0.1, 0.9, 0.3]`;
     }
     return bestScore > 0.3 ? bestParent : potentialParents[0];
   }
+  extractAllPaths(structure) {
+    const paths = /* @__PURE__ */ new Map();
+    const nodeMap = new Map(structure.nodes.map((n) => [n.id, n]));
+    const visited = /* @__PURE__ */ new Set();
+    for (const rootId of structure.rootNodes) {
+      const rootNode = nodeMap.get(rootId);
+      if (rootNode) {
+        this.extractNodePaths(rootNode, nodeMap, visited, [], paths);
+      }
+    }
+    return paths;
+  }
+  extractNodePaths(node, nodeMap, visited, ancestorPath, paths) {
+    if (visited.has(node.id)) {
+      return;
+    }
+    visited.add(node.id);
+    const fullPath = [...ancestorPath, node.label];
+    const pathString = fullPath.join(" > ");
+    paths.set(pathString, {
+      ...node,
+      level: fullPath.length - 1,
+      // 0-based level from depth
+      fullPath
+    });
+    for (const childId of node.children) {
+      const childNode = nodeMap.get(childId);
+      if (childNode) {
+        this.extractNodePaths(childNode, nodeMap, visited, fullPath, paths);
+      }
+    }
+    visited.delete(node.id);
+  }
+  rebuildRelationshipsFromPaths(allNodes, allPaths) {
+    console.log("Rebuilding parent-child relationships from paths...");
+    allNodes.forEach((node) => {
+      node.parents = [];
+      node.children = [];
+    });
+    const pathToNode = /* @__PURE__ */ new Map();
+    for (const [pathString, node] of allPaths) {
+      pathToNode.set(pathString, node);
+    }
+    for (const [pathString, node] of allPaths) {
+      const pathParts = node.fullPath;
+      if (pathParts.length > 1) {
+        const parentPath = pathParts.slice(0, -1);
+        const parentPathString = parentPath.join(" > ");
+        const parentNode = pathToNode.get(parentPathString);
+        if (parentNode) {
+          if (!node.parents.includes(parentNode.id)) {
+            node.parents.push(parentNode.id);
+          }
+          if (!parentNode.children.includes(node.id)) {
+            parentNode.children.push(node.id);
+          }
+        }
+      }
+    }
+    console.log("Rebuilt structure:");
+    allNodes.forEach((node) => {
+      if (node.level === 0) {
+        console.log(`Root: ${node.label} (children: ${node.children.length})`);
+      }
+    });
+    console.log("Finished rebuilding relationships");
+  }
   calculateNodeSimilarity(node1, node2) {
     const words1 = node1.label.toLowerCase().split(/\s+/);
     const words2 = node2.label.toLowerCase().split(/\s+/);
@@ -1956,6 +2038,7 @@ Example: [0.2, 0.8, 0.1, 0.9, 0.3]`;
     const mindmap = savedMindmap;
     const date = new Date(mindmap.createdAt).toLocaleString();
     const mindmapContent = this.convertStructureToMindmapNextGen(mindmap.structure);
+    const structureJson = JSON.stringify(mindmap.structure, null, 2);
     const frontmatter = `---
 title: "${mindmap.name}"
 created: "${mindmap.createdAt}"
@@ -1966,10 +2049,13 @@ mindmap-id: "${mindmap.id}"
 source-count: ${mindmap.sourceCount}
 llm-provider: "${mindmap.metadata.llmProvider}"
 llm-model: "${mindmap.metadata.model}"
+source-files: ${JSON.stringify(mindmap.sourceFiles)}
 markmap:
   colorFreezeLevel: 2
   maxWidth: 150
   initialExpandLevel: 3
+structure: |
+${structureJson.split("\n").map((line) => "  " + line).join("\n")}
 ---
 
 ${mindmapContent}
@@ -2018,11 +2104,15 @@ ${mindmap.sourceFiles.map((file) => `## [[${file}]]`).join("\n")}
   convertStructureToMindmapNextGen(structure) {
     const nodeMap = new Map(structure.nodes.map((node) => [node.id, node]));
     let markdown = "";
-    structure.rootNodes.forEach((rootId) => {
-      const rootNode = nodeMap.get(rootId);
-      if (rootNode) {
-        markdown += this.generateNextGenNode(rootNode, nodeMap, 1);
-      }
+    const actualRootNodes = structure.nodes.filter(
+      (node) => node.level === 0 || node.parents.length === 0
+    );
+    console.log(`Converting structure with ${structure.nodes.length} nodes, ${actualRootNodes.length} roots`);
+    actualRootNodes.forEach((root) => {
+      console.log(`Root node: ${root.label} (children: ${root.children.length})`);
+    });
+    actualRootNodes.sort((a, b) => a.label.localeCompare(b.label)).forEach((rootNode) => {
+      markdown += this.generateNextGenNode(rootNode, nodeMap, 1);
     });
     return markdown || "# No Content Generated";
   }
@@ -2033,17 +2123,20 @@ ${mindmap.sourceFiles.map((file) => `## [[${file}]]`).join("\n")}
       markdown += "\n";
       node.sourceNotes.slice(0, 3).forEach((source) => {
         var _a;
-        const fileName = ((_a = source.split("/").pop()) == null ? void 0 : _a.replace(".md", "")) || source;
-        markdown += `- [[${source}|${fileName}]]
+        if (source.startsWith("[[") && source.endsWith("]]")) {
+          markdown += `- ${source}
 `;
+        } else {
+          const fileName = ((_a = source.split("/").pop()) == null ? void 0 : _a.replace(".md", "")) || source;
+          markdown += `- [[${source}|${fileName}]]
+`;
+        }
       });
     }
-    markdown += "\n";
-    node.children.forEach((childId) => {
-      const childNode = nodeMap.get(childId);
-      if (childNode) {
-        markdown += this.generateNextGenNode(childNode, nodeMap, headingLevel + 1);
-      }
+    markdown += "\n\n";
+    const children = node.children.map((childId) => nodeMap.get(childId)).filter((child) => child).sort((a, b) => a.label.localeCompare(b.label));
+    children.forEach((childNode) => {
+      markdown += this.generateNextGenNode(childNode, nodeMap, headingLevel + 1);
     });
     return markdown;
   }
