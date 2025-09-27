@@ -104,27 +104,54 @@ var ContentAggregator = class {
     if (match) {
       try {
         const frontmatterText = match[1];
-        console.log("Frontmatter text:", frontmatterText);
         const frontmatter = {};
         const lines = frontmatterText.split(/\r?\n/);
-        for (const line of lines) {
+        let currentKey = null;
+        let currentArrayItems = [];
+        let inMultiLineValue = false;
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const trimmedLine = line.trim();
+          if (!trimmedLine)
+            continue;
           const colonIndex = line.indexOf(":");
-          if (colonIndex > 0) {
+          if (colonIndex > 0 && !line.startsWith(" ") && !line.startsWith("-")) {
+            if (currentKey && currentArrayItems.length > 0) {
+              frontmatter[currentKey] = currentArrayItems;
+              currentArrayItems = [];
+            }
             const key = line.substring(0, colonIndex).trim();
             let valueText = line.substring(colonIndex + 1).trim();
-            console.log(`Processing frontmatter line - key: "${key}", value: "${valueText}"`);
-            let value;
-            if (valueText.startsWith("[") && valueText.endsWith("]")) {
-              value = valueText.slice(1, -1).split(",").map((v) => v.trim().replace(/['"]/g, ""));
-            } else if (valueText.startsWith("-")) {
-              value = [valueText.substring(1).trim().replace(/['"]/g, "")];
+            currentKey = key;
+            inMultiLineValue = false;
+            if (valueText === "" || valueText === ">-" || valueText === "|-") {
+              inMultiLineValue = valueText === ">-" || valueText === "|-";
+            } else if (valueText.startsWith("[") && valueText.endsWith("]")) {
+              const arrayContent = valueText.slice(1, -1);
+              frontmatter[key] = arrayContent.split(",").map((v) => v.trim().replace(/^['"]|['"]$/g, ""));
+              currentKey = null;
             } else {
-              value = valueText.replace(/^['"]|['"]$/g, "");
+              frontmatter[key] = valueText.replace(/^['"]|['"]$/g, "");
+              currentKey = null;
             }
-            frontmatter[key] = value;
+          } else if (line.match(/^\s*-\s+/)) {
+            const item = line.replace(/^\s*-\s+/, "").trim().replace(/^['"]|['"]$/g, "");
+            if (currentKey) {
+              currentArrayItems.push(item);
+            }
+          } else if (inMultiLineValue && currentKey) {
+            if (!frontmatter[currentKey])
+              frontmatter[currentKey] = "";
+            frontmatter[currentKey] += (frontmatter[currentKey] ? " " : "") + trimmedLine;
           }
         }
-        console.log("Parsed frontmatter:", frontmatter);
+        if (currentKey && currentArrayItems.length > 0) {
+          frontmatter[currentKey] = currentArrayItems;
+        }
+        console.log("Parsed frontmatter keys:", Object.keys(frontmatter));
+        if (frontmatter.tags) {
+          console.log("Found tags:", frontmatter.tags);
+        }
         return {
           frontmatter,
           body: match[2].trim()
@@ -134,7 +161,6 @@ var ContentAggregator = class {
         return { frontmatter: {}, body: content };
       }
     }
-    console.log("No frontmatter found in content");
     return { frontmatter: {}, body: content };
   }
   extractTags(frontmatter, body) {
@@ -283,139 +309,60 @@ var LLMService = class {
       };
     }
   }
-  async generateMindmapStructure(processedContent, allTags) {
+  /**
+   * NEW: Analyze tag clusters and assign STEEPLE categories + subcategories
+   * Designed to handle large volumes (5000+ files) through tag analysis rather than content analysis
+   */
+  async analyzeTagClustersForSTEEPLE(tagClusters, allTags) {
     const context = {
-      sourceFiles: processedContent.map((c) => c.filePath),
+      sourceFiles: [],
       existingTags: allTags,
-      tagHierarchy: this.buildTagHierarchy(allTags)
+      tagHierarchy: {},
+      tagClusters
     };
-    const prompt = this.buildMindmapPrompt(processedContent, allTags, context);
-    const maxTokens = Math.min(this.settings.maxTokens, 4e3);
-    console.log("Generated LLM prompt:", prompt.substring(0, 500) + "...");
-    console.log("Using STEEPLE framework:", prompt.includes("STEEPLE"));
+    const prompt = this.buildSTEEPLEAnalysisPrompt(tagClusters);
+    const maxTokens = Math.min(this.settings.maxTokens, 16e3);
+    console.log("Generated STEEPLE analysis prompt:", prompt.substring(0, 500) + "...");
+    console.log(`Analyzing ${tagClusters.length} tag clusters for STEEPLE categorization`);
     return await this.makeAPICall(prompt, allTags, maxTokens);
   }
-  buildMindmapPrompt(processedContent, allTags, context) {
-    const tagWeightingInstructions = this.getTagWeightingInstructions();
-    const categorizationInstructions = this.getCategorizationInstructions();
-    const contentSummary = processedContent.map(
-      (content) => `**${content.title}** (Tags: ${content.tags.join(", ")})
-${content.content.substring(0, 300)}...`
-    ).join("\n\n");
-    return `Analyze the following content and organize it using the STEEPLE framework. Return ONLY the mindmap structure in the exact format shown below.
+  /**
+   * NEW: Build prompt for STEEPLE categorization of tag clusters
+   */
+  buildSTEEPLEAnalysisPrompt(tagClusters) {
+    const clusterSummary = tagClusters.map((cluster, index) => {
+      const relatedTagsStr = cluster.relatedTags.length > 0 ? cluster.relatedTags.slice(0, 5).join(", ") : "standalone tag";
+      return `${index + 1}. ${cluster.primaryTag} --> [${relatedTagsStr}] (${cluster.files.length} files)`;
+    }).join("\n");
+    return `Organize these tag relationships into STEEPLE categories. Create MULTIPLE subcategories per STEEPLE section.
 
-CONTENT:
-${contentSummary}
+TAG RELATIONSHIPS:
+${clusterSummary}
 
-USER TAGS: ${allTags.join(", ")}
-${tagWeightingInstructions}
+REQUIRED FORMAT:
+# TECHNOLOGICAL
+## AI Surveillance Systems
+### AI --> surveillance
+### AI --> Privacy
 
-INSTRUCTIONS:
-- Use ONLY the 7 STEEPLE categories as main headings
-- Include only STEEPLE categories that have relevant content
-- Create 2-3 subcategories under each main category
-- Put specific topics under subcategories
-- Use existing user tags where relevant
-${categorizationInstructions}
+## Biotechnology Research  
+### biotechnology --> synthetic-biology
 
-REQUIRED OUTPUT FORMAT (copy this structure exactly):
+## Military Robotics
+### DARPA --> swarm-robotics
 
-# Social
-- Demographics & Culture
-  - Population trends
-  - Cultural shifts
-- Education & Health
-  - Learning systems
-  - Healthcare trends
+## Algorithmic Pricing
+### price-discrimination --> algorithmic-pricing
 
-# Technological  
-- Innovation & AI
-  - Emerging technologies
-  - AI systems
-- Digital Transformation
-  - Platform technologies  
-  - Data systems
+# SOCIAL
+## [Another specific subcategory]
+### [tag] --> [tag]
 
-# Economic
-- Market Dynamics
-  - Business models
-  - Financial systems
-- Economic Policy
-  - Trade regulations
-  - Economic indicators
-
-# Environmental
-- Sustainability
-  - Green technology
-  - Resource management
-- Climate Impact
-  - Environmental policies
-  - Conservation efforts
-
-# Political
-- Governance
-  - Political systems  
-  - Government policies
-- Regulatory Framework
-  - Policy development
-  - Political stability
-
-# Legal
-- Compliance
-  - Legal frameworks
-  - Regulatory requirements
-- Rights & Obligations
-  - Legal standards
-  - Enforcement
-
-# Ethical
-- Corporate Responsibility
-  - Business ethics
-  - Stakeholder obligations
-- Privacy & Fairness
-  - Data protection
-  - Ethical standards
-
-IMPORTANT: 
-- Use # for main STEEPLE categories only
-- Use - for subcategories (no spaces before dash)  
-- Use  - for specific items (2 spaces before dash)
-- Only include categories with actual content
-- Organize all content into this STEEPLE structure`;
-  }
-  getTagWeightingInstructions() {
-    switch (this.settings.tagWeighting) {
-      case "high":
-        return "\nThese tags should STRONGLY influence your mindmap structure. Use them as primary organizing principles.";
-      case "medium":
-        return "\nThese tags should guide your analysis but balance them with content-derived themes.";
-      case "low":
-        return "\nThese tags provide context but prioritize content-derived themes and concepts.";
-      default:
-        return "";
-    }
-  }
-  getCategorizationInstructions() {
-    return `- IMPORTANT: Choose the PRIMARY/STRONGEST STEEPLE category for each topic
-- Place each topic in its SINGLE MOST RELEVANT category only
-- DO NOT use [ALSO: CategoryName] notation - no cross-connections
-- Avoid over-categorization - focus on the most logical placement
-- If a topic could fit multiple categories, choose the ONE that is most central to the topic's core nature`;
-  }
-  buildTagHierarchy(tags) {
-    const hierarchy = {};
-    tags.forEach((tag) => {
-      if (tag.includes("/")) {
-        const parts = tag.split("/");
-        const parent = parts[0];
-        const child = parts[1];
-        if (!hierarchy[parent]) {
-          hierarchy[parent] = [];
-        }
-        hierarchy[parent].push(child);
-      }
-    });
-    return hierarchy;
+RULES:
+1. Each STEEPLE category MUST have multiple ## subcategories
+2. Group only similar tag relationships under same subcategory
+3. AI surveillance \u2260 biotechnology \u2260 robotics - separate subcategories
+4. Never put everything under one subcategory`;
   }
   async makeAPICall(prompt, tags, maxTokens) {
     try {
@@ -539,433 +486,6 @@ IMPORTANT:
       structure: ((_d = (_c = (_b = data.choices) == null ? void 0 : _b[0]) == null ? void 0 : _c.message) == null ? void 0 : _d.content) || ((_f = (_e = data.content) == null ? void 0 : _e[0]) == null ? void 0 : _f.text) || "",
       tokensUsed: (_g = data.usage) == null ? void 0 : _g.total_tokens
     };
-  }
-};
-
-// src/services/mindmapGenerator.ts
-var MindmapGenerator = class {
-  async buildStructure(llmResponse, processedContent, settings) {
-    const nodes = this.parseLLMResponse(llmResponse);
-    const enrichedNodes = this.enrichNodesWithContent(nodes, processedContent);
-    const finalNodes = settings.enableMultiParent ? this.processMultiParentConnections(enrichedNodes) : enrichedNodes;
-    return {
-      nodes: finalNodes,
-      rootNodes: finalNodes.filter((node) => node.parents.length === 0).map((node) => node.id),
-      metadata: {
-        generatedAt: new Date().toISOString(),
-        sourceCount: processedContent.length,
-        tagCount: this.countUniqueTags(processedContent),
-        llmProvider: settings.llmProvider,
-        model: settings.model
-      }
-    };
-  }
-  parseLLMResponse(response) {
-    var _a, _b;
-    console.log("Parsing LLM response:", response.substring(0, 500) + "...");
-    const nodes = [];
-    const lines = response.split("\n").map((line) => line.replace(/\r/g, ""));
-    const nodeStack = [];
-    let currentId = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmedLine = line.trim();
-      if (!trimmedLine || trimmedLine.startsWith("```") || trimmedLine.startsWith("CONTENT:") || trimmedLine.startsWith("USER TAGS:") || trimmedLine.startsWith("INSTRUCTIONS:") || trimmedLine.startsWith("REQUIRED OUTPUT:") || trimmedLine.startsWith("IMPORTANT:")) {
-        continue;
-      }
-      console.log(`Processing line ${i + 1}: "${line}" (trimmed: "${trimmedLine}")`);
-      const isHeader = trimmedLine.startsWith("#");
-      const isDash = trimmedLine.startsWith("-") && !line.match(/^\s/);
-      const isIndentedDash = line.match(/^\s+-/);
-      let level = 0;
-      if (isHeader) {
-        level = 0;
-      } else if (isDash) {
-        level = 1;
-      } else if (isIndentedDash) {
-        const leadingSpaces = ((_b = (_a = line.match(/^(\s*)/)) == null ? void 0 : _a[1]) == null ? void 0 : _b.length) || 0;
-        level = Math.floor(leadingSpaces / 2) + 1;
-      }
-      console.log(`Line type - Header: ${isHeader}, Dash: ${!!isDash}, IndentedDash: ${!!isIndentedDash}, Level: ${level}`);
-      if (isHeader) {
-        const label = trimmedLine.replace(/^#+\s*/, "").trim();
-        console.log(`Creating header node: "${label}"`);
-        const node = {
-          id: `node_${currentId++}`,
-          label,
-          content: label,
-          parents: [],
-          children: [],
-          tags: [],
-          sourceNotes: [],
-          level: 0
-        };
-        nodes.push(node);
-        nodeStack.length = 0;
-        nodeStack.push({ node, level: 0 });
-      } else if (isDash || isIndentedDash) {
-        const label = trimmedLine.replace(/^-\s*/, "").trim();
-        console.log(`Creating dash node: "${label}" at level ${level}`);
-        const { label: cleanLabel, alsoParents } = this.parseNodeLabel(label);
-        const node = {
-          id: `node_${currentId++}`,
-          label: cleanLabel,
-          content: cleanLabel,
-          parents: [],
-          children: [],
-          tags: alsoParents,
-          sourceNotes: [],
-          level
-        };
-        while (nodeStack.length > 0 && nodeStack[nodeStack.length - 1].level >= level) {
-          console.log(`Popping node from stack: ${nodeStack[nodeStack.length - 1].node.label} (level ${nodeStack[nodeStack.length - 1].level})`);
-          nodeStack.pop();
-        }
-        if (nodeStack.length > 0) {
-          const parent = nodeStack[nodeStack.length - 1].node;
-          console.log(`Setting parent: ${parent.label} -> ${cleanLabel}`);
-          node.parents.push(parent.id);
-          parent.children.push(node.id);
-        } else {
-          console.warn(`No parent found for node: ${cleanLabel}`);
-        }
-        nodes.push(node);
-        nodeStack.push({ node, level });
-      }
-    }
-    console.log(`Created ${nodes.length} nodes:`);
-    nodes.forEach((node) => {
-      console.log(`- ${node.label} (level: ${node.level}, children: ${node.children.length}, parents: ${node.parents.length})`);
-    });
-    return nodes;
-  }
-  getIndentationLevel(line) {
-    let level = 0;
-    for (const char of line) {
-      if (char === " ") {
-        level += 0.25;
-      } else if (char === "	") {
-        level += 1;
-      } else if (char === "-") {
-        break;
-      } else if (!char.match(/\s/)) {
-        break;
-      }
-    }
-    return Math.floor(level);
-  }
-  parseNodeLabel(text) {
-    text = text.replace(/^\[|\]$/g, "");
-    const alsoMatch = text.match(/(.+?)\s*\[ALSO:\s*([^\]]+)\]/);
-    if (alsoMatch) {
-      return {
-        label: alsoMatch[1].trim(),
-        alsoParents: [alsoMatch[2].trim()]
-      };
-    }
-    return {
-      label: text,
-      alsoParents: []
-    };
-  }
-  enrichNodesWithContent(nodes, processedContent) {
-    const contentAssignments = this.assignContentToNodes(nodes, processedContent);
-    return nodes.map((node) => {
-      const assignedContent = contentAssignments.get(node.id) || [];
-      const relevantTags = [...new Set(assignedContent.flatMap((content) => content.tags))];
-      const summary = this.generateContentSummaryFromAssigned(assignedContent, node.label);
-      return {
-        ...node,
-        content: summary || node.label,
-        sourceNotes: assignedContent.map((content) => content.filePath),
-        tags: [.../* @__PURE__ */ new Set([...node.tags, ...relevantTags])]
-      };
-    });
-  }
-  assignContentToNodes(nodes, processedContent) {
-    const assignments = /* @__PURE__ */ new Map();
-    const usedContent = /* @__PURE__ */ new Set();
-    nodes.forEach((node) => assignments.set(node.id, []));
-    processedContent.forEach((content) => {
-      if (usedContent.has(content.filePath))
-        return;
-      let bestMatch = null;
-      nodes.forEach((node) => {
-        const score = this.calculateNodeContentMatch(node, content);
-        if (!bestMatch || score > bestMatch.score) {
-          bestMatch = { node, score };
-        }
-      });
-      if (bestMatch && bestMatch.score > 0) {
-        assignments.get(bestMatch.node.id).push(content);
-        usedContent.add(content.filePath);
-        console.log(`Assigned "${content.title}" to node "${bestMatch.node.label}" (score: ${bestMatch.score})`);
-      }
-    });
-    return assignments;
-  }
-  calculateNodeContentMatch(node, content) {
-    const nodeKeywords = this.extractKeywords(node.label);
-    const contentKeywords = this.extractKeywords(content.title + " " + content.content);
-    const overlap = nodeKeywords.filter((keyword) => contentKeywords.includes(keyword));
-    const overlapRatio = overlap.length / Math.max(nodeKeywords.length, 1);
-    const hierarchyBoost = node.level * 0.1;
-    const tagMatches = node.tags.filter((tag) => content.tags.includes(tag)).length;
-    const tagBoost = tagMatches * 0.2;
-    return overlapRatio + hierarchyBoost + tagBoost;
-  }
-  generateContentSummaryFromAssigned(assignedContent, nodeLabel) {
-    if (assignedContent.length === 0) {
-      return nodeLabel;
-    }
-    const keywords = this.extractKeywords(nodeLabel);
-    const relevantSentences = [];
-    assignedContent.forEach((content) => {
-      const sentences = content.content.split(/[.!?]+/);
-      sentences.forEach((sentence) => {
-        const sentenceKeywords = this.extractKeywords(sentence);
-        const keywordOverlap = keywords.filter((k) => sentenceKeywords.includes(k));
-        if (keywordOverlap.length > 0) {
-          relevantSentences.push(sentence.trim());
-        }
-      });
-    });
-    return relevantSentences.length > 0 ? relevantSentences[0].substring(0, 150) + "..." : nodeLabel;
-  }
-  buildContentSearchIndex(processedContent) {
-    const index = /* @__PURE__ */ new Map();
-    processedContent.forEach((content) => {
-      const keywords = this.extractKeywords(content.title + " " + content.content);
-      keywords.forEach((keyword) => {
-        if (!index.has(keyword)) {
-          index.set(keyword, []);
-        }
-        index.get(keyword).push(content);
-      });
-    });
-    return index;
-  }
-  extractKeywords(text) {
-    return text.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/).filter((word) => word.length > 3).filter((word) => !this.isStopWord(word));
-  }
-  isStopWord(word) {
-    const stopWords = /* @__PURE__ */ new Set([
-      "the",
-      "and",
-      "or",
-      "but",
-      "in",
-      "on",
-      "at",
-      "to",
-      "for",
-      "of",
-      "with",
-      "by",
-      "this",
-      "that",
-      "these",
-      "those",
-      "a",
-      "an",
-      "is",
-      "was",
-      "are",
-      "were",
-      "be",
-      "been",
-      "being",
-      "have",
-      "has",
-      "had",
-      "do",
-      "does",
-      "did",
-      "will",
-      "would",
-      "could",
-      "should",
-      "may",
-      "might",
-      "must",
-      "can",
-      "about",
-      "into",
-      "through",
-      "during",
-      "before",
-      "after",
-      "above",
-      "below",
-      "from",
-      "up",
-      "down",
-      "out"
-    ]);
-    return stopWords.has(word.toLowerCase());
-  }
-  findRelevantContent(nodeLabel, contentIndex, allContent) {
-    const keywords = this.extractKeywords(nodeLabel);
-    const relevantContent = [];
-    const sourceFiles = /* @__PURE__ */ new Set();
-    const tags = /* @__PURE__ */ new Set();
-    keywords.forEach((keyword) => {
-      const matchingContent = contentIndex.get(keyword) || [];
-      matchingContent.forEach((content) => {
-        if (!relevantContent.some((c) => c.filePath === content.filePath)) {
-          relevantContent.push(content);
-        }
-        sourceFiles.add(content.filePath);
-        content.tags.forEach((tag) => tags.add(tag));
-      });
-    });
-    const summary = this.generateContentSummary(relevantContent, nodeLabel);
-    return {
-      summary,
-      sourceFiles: Array.from(sourceFiles),
-      tags: Array.from(tags)
-    };
-  }
-  generateContentSummary(relevantContent, nodeLabel) {
-    if (relevantContent.length === 0) {
-      return nodeLabel;
-    }
-    const keywords = this.extractKeywords(nodeLabel);
-    const relevantSentences = [];
-    relevantContent.forEach((content) => {
-      const sentences = content.content.split(/[.!?]+/);
-      sentences.forEach((sentence) => {
-        const sentenceKeywords = this.extractKeywords(sentence);
-        const keywordOverlap = keywords.filter((k) => sentenceKeywords.includes(k));
-        if (keywordOverlap.length > 0) {
-          relevantSentences.push(sentence.trim());
-        }
-      });
-    });
-    return relevantSentences.length > 0 ? relevantSentences[0].substring(0, 150) + "..." : nodeLabel;
-  }
-  processMultiParentConnections(nodes) {
-    console.log("Processing multi-parent connections...");
-    const nodeByLabel = new Map(nodes.map((node) => [node.label.toLowerCase(), node]));
-    const steepleCategories = /* @__PURE__ */ new Map([
-      ["social", "Social"],
-      ["technological", "Technological"],
-      ["economic", "Economic"],
-      ["environmental", "Environmental"],
-      ["political", "Political"],
-      ["legal", "Legal"],
-      ["ethical", "Ethical"]
-    ]);
-    return nodes.map((node) => {
-      const additionalParents = [];
-      node.tags.forEach((tag) => {
-        console.log(`Processing tag "${tag}" for node "${node.label}"`);
-        let parentNode = nodeByLabel.get(tag.toLowerCase());
-        if (!parentNode) {
-          const steepleKey = steepleCategories.get(tag.toLowerCase());
-          if (steepleKey) {
-            parentNode = nodeByLabel.get(steepleKey.toLowerCase());
-          }
-        }
-        if (!parentNode) {
-          for (const [key, fullName] of steepleCategories) {
-            if (tag.toLowerCase().includes(key) || fullName.toLowerCase().includes(tag.toLowerCase())) {
-              parentNode = nodeByLabel.get(fullName.toLowerCase());
-              break;
-            }
-          }
-        }
-        if (parentNode && parentNode.id !== node.id && !node.parents.includes(parentNode.id)) {
-          console.log(`Adding multi-parent connection: "${node.label}" -> "${parentNode.label}"`);
-          additionalParents.push(parentNode.id);
-          if (!parentNode.children.includes(node.id)) {
-            parentNode.children.push(node.id);
-          }
-        }
-      });
-      const processedTags = node.tags.filter((tag) => {
-        const isParentRef = nodeByLabel.has(tag.toLowerCase()) || steepleCategories.has(tag.toLowerCase()) || Array.from(steepleCategories.values()).some(
-          (cat) => cat.toLowerCase().includes(tag.toLowerCase())
-        );
-        return !isParentRef;
-      });
-      return {
-        ...node,
-        parents: [...node.parents, ...additionalParents],
-        tags: processedTags
-      };
-    });
-  }
-  countUniqueTags(processedContent) {
-    const allTags = /* @__PURE__ */ new Set();
-    processedContent.forEach((content) => {
-      content.tags.forEach((tag) => allTags.add(tag));
-    });
-    return allTags.size;
-  }
-  convertToMarkdown(structure) {
-    const header = this.generateMarkdownHeader(structure);
-    const mindmapContent = this.generateMarkdownMindmap(structure);
-    return `${header}
-
-${mindmapContent}`;
-  }
-  generateMarkdownHeader(structure) {
-    const date = new Date(structure.metadata.generatedAt).toLocaleString();
-    return `---
-title: "AI Generated Mindmap"
-created: "${structure.metadata.generatedAt}"
-tags: [ai-mindmap, auto-generated]
----
-
-# AI Generated Mindmap
-
-**Generated:** ${date}  
-**Sources:** ${structure.metadata.sourceCount} files  
-**Tags:** ${structure.metadata.tagCount} unique tags  
-**Model:** ${structure.metadata.llmProvider} (${structure.metadata.model})
-
----
-
-## Mindmap Structure
-
-\`\`\`markmap
----
-markmap:
-  colorFreezeLevel: 2
----`;
-  }
-  generateMarkdownMindmap(structure) {
-    const nodeMap = new Map(structure.nodes.map((node) => [node.id, node]));
-    let markdown = "";
-    structure.rootNodes.forEach((rootId) => {
-      const rootNode = nodeMap.get(rootId);
-      if (rootNode) {
-        markdown += this.generateNodeMarkdown(rootNode, nodeMap, 0);
-      }
-    });
-    markdown += "\n```\n\n## Source Files\n\n";
-    const allSourceFiles = /* @__PURE__ */ new Set();
-    structure.nodes.forEach((node) => {
-      node.sourceNotes.forEach((source) => allSourceFiles.add(source));
-    });
-    Array.from(allSourceFiles).forEach((file) => {
-      markdown += `- [[${file}]]
-`;
-    });
-    return markdown;
-  }
-  generateNodeMarkdown(node, nodeMap, depth) {
-    const indent = "  ".repeat(depth);
-    let markdown = `${indent}- ${node.label}
-`;
-    node.children.forEach((childId) => {
-      const childNode = nodeMap.get(childId);
-      if (childNode) {
-        markdown += this.generateNodeMarkdown(childNode, nodeMap, depth + 1);
-      }
-    });
-    return markdown;
   }
 };
 
@@ -2183,6 +1703,507 @@ ${mindmap.sourceFiles.map((file) => `## [[${file}]]`).join("\n")}
   }
 };
 
+// src/services/tagCooccurrenceAnalyzer.ts
+var TagCooccurrenceAnalyzer = class {
+  /**
+   * Main analysis function - implements the process from Sample_Structure.md
+   */
+  async analyzeTagCooccurrences(processedContent) {
+    console.log(`Starting tag co-occurrence analysis for ${processedContent.length} files`);
+    const tagFrequency = this.extractTagFrequencies(processedContent);
+    console.log(`Found ${Object.keys(tagFrequency).length} unique tags`);
+    const cooccurrences = this.buildCooccurrenceMatrix(processedContent);
+    console.log(`Found ${cooccurrences.length} tag co-occurrences`);
+    const frequentTags = this.filterLowFrequencyTags(tagFrequency, 1);
+    const filteredCooccurrences = this.filterByMinimumSharedFiles(cooccurrences, 1, frequentTags);
+    console.log(`${filteredCooccurrences.length} co-occurrences meet minimum threshold`);
+    const networkNodes = this.buildNetworkNodes(tagFrequency, filteredCooccurrences);
+    const clusters = this.identifyTagClusters(filteredCooccurrences, networkNodes);
+    console.log(`Identified ${clusters.length} tag clusters`);
+    return {
+      nodes: networkNodes,
+      edges: filteredCooccurrences,
+      clusters,
+      totalFiles: processedContent.length,
+      totalTags: Object.keys(tagFrequency).length
+    };
+  }
+  /**
+   * Extract tag frequencies from all processed content
+   */
+  extractTagFrequencies(processedContent) {
+    const tagFrequency = {};
+    processedContent.forEach((content) => {
+      const uniqueTags = new Set(content.tags);
+      uniqueTags.forEach((tag) => {
+        tagFrequency[tag] = (tagFrequency[tag] || 0) + 1;
+      });
+    });
+    console.log("Tag frequency analysis:");
+    const sortedTags = Object.entries(tagFrequency).sort(([, a], [, b]) => b - a).slice(0, 10);
+    sortedTags.forEach(([tag, count]) => {
+      console.log(`  ${tag}: ${count} files`);
+    });
+    return tagFrequency;
+  }
+  /**
+   * Build co-occurrence matrix - find which tags appear together in files
+   */
+  buildCooccurrenceMatrix(processedContent) {
+    const cooccurrenceMap = /* @__PURE__ */ new Map();
+    processedContent.forEach((content) => {
+      const tags = content.tags;
+      for (let i = 0; i < tags.length; i++) {
+        for (let j = i + 1; j < tags.length; j++) {
+          const tag1 = tags[i];
+          const tag2 = tags[j];
+          const key = tag1 < tag2 ? `${tag1}|${tag2}` : `${tag2}|${tag1}`;
+          const sortedTags = tag1 < tag2 ? [tag1, tag2] : [tag2, tag1];
+          if (!cooccurrenceMap.has(key)) {
+            cooccurrenceMap.set(key, {
+              tag1: sortedTags[0],
+              tag2: sortedTags[1],
+              cooccurrenceCount: 0,
+              sharedFiles: [],
+              strength: 0
+            });
+          }
+          const cooccurrence = cooccurrenceMap.get(key);
+          cooccurrence.cooccurrenceCount++;
+          cooccurrence.sharedFiles.push(content.filePath);
+        }
+      }
+    });
+    const cooccurrences = Array.from(cooccurrenceMap.values());
+    cooccurrences.forEach((cooccurrence) => {
+      cooccurrence.strength = cooccurrence.cooccurrenceCount / Math.max(1, cooccurrences.length);
+    });
+    return cooccurrences;
+  }
+  /**
+   * Filter co-occurrences by minimum shared files requirement and tag frequency
+   * RELAXED: Now allows 1+ shared files to capture more emerging relationships
+   */
+  filterByMinimumSharedFiles(cooccurrences, minSharedFiles, frequentTags) {
+    const filtered = cooccurrences.filter(
+      (co) => co.cooccurrenceCount >= Math.max(minSharedFiles, 1) && // RELAXED: Allow 1+ shared files
+      frequentTags.has(co.tag1) && frequentTags.has(co.tag2)
+    );
+    console.log(`Filtering: ${cooccurrences.length} -> ${filtered.length} co-occurrences (min: ${Math.max(minSharedFiles, 1)} shared files, frequent tags only)`);
+    const topCooccurrences = filtered.sort((a, b) => b.cooccurrenceCount - a.cooccurrenceCount).slice(0, 15);
+    console.log("Top tag co-occurrences:");
+    topCooccurrences.forEach((co) => {
+      console.log(`  ${co.tag1} <-> ${co.tag2}: ${co.cooccurrenceCount} files`);
+    });
+    return filtered;
+  }
+  /**
+   * Build network nodes with centrality metrics
+   */
+  buildNetworkNodes(tagFrequency, cooccurrences) {
+    const connectionCounts = {};
+    cooccurrences.forEach((co) => {
+      if (!connectionCounts[co.tag1])
+        connectionCounts[co.tag1] = /* @__PURE__ */ new Set();
+      if (!connectionCounts[co.tag2])
+        connectionCounts[co.tag2] = /* @__PURE__ */ new Set();
+      connectionCounts[co.tag1].add(co.tag2);
+      connectionCounts[co.tag2].add(co.tag1);
+    });
+    const nodes = Object.entries(tagFrequency).map(([tag, frequency]) => {
+      var _a;
+      const connections = ((_a = connectionCounts[tag]) == null ? void 0 : _a.size) || 0;
+      const centrality = frequency * connections;
+      return {
+        tag,
+        frequency,
+        connections,
+        centrality
+      };
+    });
+    nodes.sort((a, b) => b.centrality - a.centrality);
+    console.log("Most central tags:");
+    nodes.slice(0, 10).forEach((node) => {
+      console.log(`  ${node.tag}: freq=${node.frequency}, connections=${node.connections}, centrality=${node.centrality}`);
+    });
+    return nodes;
+  }
+  /**
+   * Identify clusters of related tags based on natural co-occurrence patterns + high-frequency standalone tags
+   * IMPROVED: Captures both relationships AND important standalone signals without rigid taxonomy
+   */
+  identifyTagClusters(cooccurrences, nodes) {
+    console.log("Building natural tag clusters from co-occurrence patterns + standalone signals...");
+    const clusters = [];
+    const processedTags = /* @__PURE__ */ new Set();
+    const tagFrequency = {};
+    nodes.forEach((node) => {
+      tagFrequency[node.tag] = node.frequency;
+    });
+    const sortedNodes = [...nodes].sort((a, b) => b.centrality - a.centrality);
+    sortedNodes.forEach((node) => {
+      if (processedTags.has(node.tag))
+        return;
+      const relatedTags = [];
+      const clusterFiles = /* @__PURE__ */ new Set();
+      let totalStrength = 0;
+      cooccurrences.forEach((co) => {
+        if (co.tag1 === node.tag && !processedTags.has(co.tag2)) {
+          relatedTags.push(co.tag2);
+          co.sharedFiles.forEach((file) => clusterFiles.add(file));
+          totalStrength += co.strength;
+          processedTags.add(co.tag2);
+        } else if (co.tag2 === node.tag && !processedTags.has(co.tag1)) {
+          relatedTags.push(co.tag1);
+          co.sharedFiles.forEach((file) => clusterFiles.add(file));
+          totalStrength += co.strength;
+          processedTags.add(co.tag1);
+        }
+      });
+      if (relatedTags.length > 0 || node.frequency >= 3) {
+        clusters.push({
+          primaryTag: node.tag,
+          relatedTags,
+          files: Array.from(clusterFiles),
+          strength: relatedTags.length > 0 ? totalStrength / relatedTags.length : node.frequency
+        });
+        processedTags.add(node.tag);
+        if (relatedTags.length > 0) {
+          console.log(`  Co-occurrence cluster: ${node.tag} -> [${relatedTags.slice(0, 4).join(", ")}] (${clusterFiles.size} files)`);
+        } else {
+          console.log(`  High-frequency standalone: ${node.tag} (${node.frequency} files)`);
+        }
+      }
+    });
+    const standaloneThreshold = Math.max(3, Math.floor(nodes.length * 0.08));
+    const remainingStandaloneTags = nodes.filter((node) => !processedTags.has(node.tag) && node.frequency >= standaloneThreshold).sort((a, b) => b.frequency - a.frequency).slice(0, 10);
+    remainingStandaloneTags.forEach((node) => {
+      const tagFiles = /* @__PURE__ */ new Set();
+      cooccurrences.forEach((co) => {
+        if (co.tag1 === node.tag || co.tag2 === node.tag) {
+          co.sharedFiles.forEach((file) => tagFiles.add(file));
+        }
+      });
+      clusters.push({
+        primaryTag: node.tag,
+        relatedTags: [],
+        files: Array.from(tagFiles),
+        strength: node.frequency
+      });
+      processedTags.add(node.tag);
+      console.log(`  Additional standalone: ${node.tag} (${node.frequency} files)`);
+    });
+    clusters.sort((a, b) => b.strength - a.strength);
+    console.log(`
+Final natural clusters: ${clusters.length} clusters from ${processedTags.size} tags`);
+    console.log(`This gives Claude diverse input for discovering emerging patterns and trends`);
+    clusters.slice(0, 8).forEach((cluster, index) => {
+      const type = cluster.relatedTags.length > 0 ? "Connected" : "Standalone";
+      console.log(`  ${index + 1}. [${type}] ${cluster.primaryTag} -> [${cluster.relatedTags.slice(0, 3).join(", ")}] (${cluster.files.length} files)`);
+    });
+    return clusters;
+  }
+  /**
+   * Generate tag relationship strings for LLM analysis
+   * Format: "tag1 --> tag2" as shown in Sample_Structure.md
+   */
+  generateTagRelationshipStrings(clusters) {
+    const relationships = [];
+    clusters.forEach((cluster) => {
+      cluster.relatedTags.forEach((relatedTag) => {
+        relationships.push(`${cluster.primaryTag} --> ${relatedTag}`);
+      });
+    });
+    return relationships;
+  }
+  /**
+   * Get files associated with a specific tag relationship
+   */
+  getFilesForTagRelationship(tag1, tag2, cooccurrences) {
+    const relationship = cooccurrences.find(
+      (co) => co.tag1 === tag1 && co.tag2 === tag2 || co.tag1 === tag2 && co.tag2 === tag1
+    );
+    return relationship ? relationship.sharedFiles : [];
+  }
+  /**
+   * Debug method to export network data for visualization
+   */
+  exportNetworkForVisualization(network) {
+    return {
+      nodes: network.nodes.map((node) => ({
+        id: node.tag,
+        label: node.tag,
+        size: Math.log(node.frequency + 1) * 10,
+        color: this.getColorByConnections(node.connections)
+      })),
+      edges: network.edges.map((edge) => ({
+        source: edge.tag1,
+        target: edge.tag2,
+        weight: edge.cooccurrenceCount,
+        label: `${edge.cooccurrenceCount} files`
+      })),
+      clusters: network.clusters.map((cluster) => ({
+        primary: cluster.primaryTag,
+        related: cluster.relatedTags,
+        files: cluster.files.length
+      }))
+    };
+  }
+  /**
+   * Filter out tags that appear in very few files to reduce noise
+   * RELAXED: Lower threshold to capture more emerging signals
+   */
+  filterLowFrequencyTags(tagFrequency, minFrequency) {
+    const frequentTags = /* @__PURE__ */ new Set();
+    Object.entries(tagFrequency).forEach(([tag, frequency]) => {
+      if (frequency >= minFrequency) {
+        frequentTags.add(tag);
+      }
+    });
+    console.log(`Tag frequency filtering: ${Object.keys(tagFrequency).length} -> ${frequentTags.size} tags (min frequency: ${minFrequency})`);
+    const distribution = Object.values(tagFrequency).reduce((acc, freq) => {
+      acc[freq] = (acc[freq] || 0) + 1;
+      return acc;
+    }, {});
+    console.log("Tag frequency distribution:", Object.entries(distribution).sort(([a], [b]) => Number(b) - Number(a)).slice(0, 5).map(([freq, count]) => `${freq} files: ${count} tags`).join(", "));
+    return frequentTags;
+  }
+  getColorByConnections(connections) {
+    if (connections >= 10)
+      return "#ff4444";
+    if (connections >= 5)
+      return "#ff8800";
+    if (connections >= 2)
+      return "#ffff00";
+    return "#888888";
+  }
+};
+
+// src/services/tagDrivenMindmapGenerator.ts
+var TagDrivenMindmapGenerator = class {
+  constructor(settings) {
+    this.tagAnalyzer = new TagCooccurrenceAnalyzer();
+    this.llmService = new LLMService(settings);
+  }
+  /**
+   * Main generation method - implements the new tag-driven approach from Sample_Structure.md
+   */
+  async generateTagDrivenMindmap(processedContent) {
+    console.log(`Starting tag-driven mindmap generation for ${processedContent.length} files`);
+    console.log("Step 1: Analyzing tag co-occurrence network...");
+    const tagNetwork = await this.tagAnalyzer.analyzeTagCooccurrences(processedContent);
+    console.log("Step 2: LLM analysis for STEEPLE categorization...");
+    const steepleAnalysis = await this.llmService.analyzeTagClustersForSTEEPLE(
+      tagNetwork.clusters,
+      Object.keys(this.extractAllTags(processedContent))
+    );
+    if (!steepleAnalysis.success) {
+      throw new Error(`LLM analysis failed: ${steepleAnalysis.error}`);
+    }
+    console.log("Step 3: Building final mindmap structure...");
+    const steepleCategories = this.parseLLMResponseToStructure(
+      steepleAnalysis.structure,
+      tagNetwork,
+      processedContent
+    );
+    const finalStructure = {
+      steepleCategories,
+      metadata: {
+        generatedAt: new Date().toISOString(),
+        sourceCount: processedContent.length,
+        tagCount: tagNetwork.totalTags,
+        relationshipCount: tagNetwork.edges.length,
+        llmProvider: "claude",
+        // TODO: get from settings
+        model: "claude-sonnet-4-0"
+        // Latest Claude Sonnet model
+      }
+    };
+    console.log(`Generated mindmap with ${steepleCategories.length} STEEPLE categories and ${tagNetwork.edges.length} tag relationships`);
+    return finalStructure;
+  }
+  /**
+   * Parse LLM response into structured STEEPLE categories with multiple subcategories support
+   * FIXED: Now properly handles multiple subcategories per STEEPLE category
+   */
+  parseLLMResponseToStructure(llmResponse, tagNetwork, processedContent) {
+    const categoriesMap = /* @__PURE__ */ new Map();
+    const lines = llmResponse.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+    let currentCategoryName = null;
+    let currentSubcategory = null;
+    for (const line of lines) {
+      const categoryMatch = line.match(/^#\s+(.+)$/);
+      if (categoryMatch) {
+        const categoryName = categoryMatch[1].trim();
+        const validSteepleNames = ["Social", "Technological", "Economic", "Environmental", "Political", "Legal", "Ethical"];
+        const matchedName = validSteepleNames.find(
+          (name) => categoryName.toLowerCase().includes(name.toLowerCase())
+        );
+        if (matchedName) {
+          currentCategoryName = matchedName;
+          if (!categoriesMap.has(currentCategoryName)) {
+            categoriesMap.set(currentCategoryName, {
+              name: matchedName,
+              subcategories: []
+            });
+          }
+          currentSubcategory = null;
+        }
+        continue;
+      }
+      const subcategoryMatch = line.match(/^##\s+(.+)$/);
+      if (subcategoryMatch && currentCategoryName) {
+        const subcategoryName = subcategoryMatch[1].trim();
+        currentSubcategory = {
+          name: subcategoryName,
+          tagRelationships: []
+        };
+        const category = categoriesMap.get(currentCategoryName);
+        category.subcategories.push(currentSubcategory);
+        continue;
+      }
+      const relationshipMatch = line.match(/^###\s+(.+?)\s+-->\s+(.+)$/);
+      if (relationshipMatch && currentSubcategory) {
+        const primaryTag = relationshipMatch[1].trim();
+        const secondaryTagsString = relationshipMatch[2].trim();
+        const secondaryTags = secondaryTagsString.split(",").map((tag) => tag.trim());
+        secondaryTags.forEach((secondaryTag) => {
+          const sharedFiles = this.findFilesForTagPair(primaryTag, secondaryTag, processedContent);
+          const relationship = {
+            primaryTag,
+            secondaryTag,
+            relationshipType: "co-occurs with",
+            sharedFiles
+          };
+          currentSubcategory.tagRelationships.push(relationship);
+        });
+        continue;
+      }
+    }
+    const categories = Array.from(categoriesMap.values());
+    console.log(`Parsed ${categories.length} STEEPLE categories from LLM response`);
+    categories.forEach((cat) => {
+      const totalRelationships = cat.subcategories.reduce((sum, sub) => sum + sub.tagRelationships.length, 0);
+      console.log(`  ${cat.name}: ${cat.subcategories.length} subcategories, ${totalRelationships} relationships`);
+      cat.subcategories.forEach((sub) => {
+        console.log(`    - "${sub.name}" (${sub.tagRelationships.length} relationships)`);
+      });
+    });
+    return categories;
+  }
+  /**
+   * Find files that contain both tags in a relationship, with fallback to either tag
+   */
+  findFilesForTagPair(tag1, tag2, processedContent) {
+    const sharedFiles = [];
+    const primaryTagFiles = [];
+    const secondaryTagFiles = [];
+    processedContent.forEach((content) => {
+      const contentTags = content.tags.map((t) => t.toLowerCase());
+      const hasTag1 = contentTags.includes(tag1.toLowerCase());
+      const hasTag2 = contentTags.includes(tag2.toLowerCase());
+      if (hasTag1 && hasTag2) {
+        sharedFiles.push(content.filePath);
+      } else if (hasTag1) {
+        primaryTagFiles.push(content.filePath);
+      } else if (hasTag2) {
+        secondaryTagFiles.push(content.filePath);
+      }
+    });
+    console.log(`Finding files for "${tag1}" --> "${tag2}": shared=${sharedFiles.length}, primary=${primaryTagFiles.length}, secondary=${secondaryTagFiles.length}`);
+    if (sharedFiles.length > 0) {
+      return sharedFiles;
+    }
+    const fallbackFiles = [...primaryTagFiles, ...secondaryTagFiles].slice(0, 5);
+    console.log(`Using fallback files: ${fallbackFiles.length} total`);
+    return fallbackFiles;
+  }
+  /**
+   * Extract all unique tags from processed content
+   */
+  extractAllTags(processedContent) {
+    const tagFrequency = {};
+    processedContent.forEach((content) => {
+      const uniqueTags = new Set(content.tags);
+      uniqueTags.forEach((tag) => {
+        tagFrequency[tag] = (tagFrequency[tag] || 0) + 1;
+      });
+    });
+    return tagFrequency;
+  }
+  /**
+   * Convert the tag-driven structure to markdown format matching Sample_Structure.md
+   */
+  generateMarkdownOutput(structure, name) {
+    const timestamp = new Date().toLocaleDateString("en-US", {
+      month: "numeric",
+      day: "numeric",
+      year: "numeric"
+    });
+    const generatedName = name || `Tag Analysis (${structure.metadata.sourceCount} files) - ${timestamp}`;
+    const steepleCategories = structure.steepleCategories.map((cat) => cat.name);
+    const frontmatter = `---
+title: "${generatedName}"
+created: "${structure.metadata.generatedAt}"
+modified: "${structure.metadata.generatedAt}"
+type: mindmap
+tags: [ai-mindmap, ${steepleCategories.map((c) => c.toLowerCase()).join(", ")}]
+mindmap-plugin: basic
+mindmap-id: ${this.generateId()}
+markmap:
+  colorFreezeLevel: 2
+  maxWidth: 150
+  initialExpandLevel: 3
+---`;
+    let content = "";
+    structure.steepleCategories.forEach((category) => {
+      content += `# ${category.name.toUpperCase()}
+
+`;
+      category.subcategories.forEach((subcategory) => {
+        content += `## ${subcategory.name}
+
+`;
+        subcategory.tagRelationships.forEach((relationship) => {
+          content += `### ${relationship.primaryTag} --> ${relationship.secondaryTag}
+`;
+          if (relationship.sharedFiles.length > 0) {
+            relationship.sharedFiles.forEach((file) => {
+              var _a;
+              const fileName = ((_a = file.split("/").pop()) == null ? void 0 : _a.replace(".md", "")) || file;
+              content += `- [[${file}|${fileName}]]
+`;
+            });
+          } else {
+            content += `- _No files found with both tags_
+`;
+          }
+          content += "\n";
+        });
+        content += "\n";
+      });
+    });
+    return `${frontmatter}
+
+${content}`;
+  }
+  /**
+   * Update settings for the LLM service
+   */
+  updateSettings(settings) {
+    this.llmService.updateSettings(settings);
+  }
+  /**
+   * Test the LLM connection
+   */
+  async testConnection() {
+    return await this.llmService.testConnection();
+  }
+  generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
+  }
+};
+
 // src/components/sourceSelectorModal.ts
 var import_obsidian3 = require("obsidian");
 var SourceSelectorModal = class extends import_obsidian3.Modal {
@@ -2211,7 +2232,6 @@ var SourceSelectorModal = class extends import_obsidian3.Modal {
     contentEl.createEl("h2", { text: "Select Content for AI Mindmap" });
     this.createFileSelection();
     this.createFolderSelection();
-    this.createTagSelection();
     this.createOptionsSection();
     this.createPreviewSection();
     this.createActionButtons();
@@ -2253,6 +2273,12 @@ var SourceSelectorModal = class extends import_obsidian3.Modal {
     sortSelect.createEl("option", { text: "Sort by Name", value: "name" });
     sortSelect.createEl("option", { text: "Sort by Path", value: "path" });
     sortSelect.createEl("option", { text: "Sort by Modified", value: "modified" });
+    const selectAllBtn = sortContainer.createEl("button", { text: "Select All" });
+    selectAllBtn.style.padding = "4px 8px";
+    selectAllBtn.style.marginRight = "5px";
+    const selectNoneBtn = sortContainer.createEl("button", { text: "Select None" });
+    selectNoneBtn.style.padding = "4px 8px";
+    selectNoneBtn.style.marginRight = "10px";
     const toggleContainer = sortContainer.createDiv();
     const showSelectedOnly = toggleContainer.createEl("input", { type: "checkbox" });
     showSelectedOnly.id = "show-selected-only";
@@ -2347,6 +2373,20 @@ var SourceSelectorModal = class extends import_obsidian3.Modal {
     folderSelect.addEventListener("change", updateFileList);
     sortSelect.addEventListener("change", updateFileList);
     showSelectedOnly.addEventListener("change", updateFileList);
+    selectAllBtn.addEventListener("click", () => {
+      filteredFiles.forEach((file) => {
+        if (!this.selection.files.includes(file.path)) {
+          this.selection.files.push(file.path);
+        }
+      });
+      this.updatePreview();
+      updateFileList();
+    });
+    selectNoneBtn.addEventListener("click", () => {
+      this.selection.files = [];
+      this.updatePreview();
+      updateFileList();
+    });
     updateFileList();
   }
   createFolderSelection() {
@@ -2383,37 +2423,6 @@ var SourceSelectorModal = class extends import_obsidian3.Modal {
         text: ` (${fileCount} files)`,
         cls: "file-count"
       });
-    });
-  }
-  createTagSelection() {
-    const { contentEl } = this;
-    const tagSection = contentEl.createDiv();
-    tagSection.createEl("h3", { text: "Tags" });
-    const allTags = this.plugin.contentAggregator.getAllTags().slice(0, 30);
-    const tagList = tagSection.createDiv({ cls: "tag-selection-list" });
-    allTags.forEach((tag) => {
-      const tagItem = tagList.createDiv({ cls: "tag-item" });
-      const checkbox = tagItem.createEl("input", { type: "checkbox" });
-      checkbox.id = `tag-${tag}`;
-      checkbox.addEventListener("change", (e) => {
-        const target = e.target;
-        console.log("Tag checkbox changed:", tag, "checked:", target.checked, "selection exists:", !!this.selection);
-        if (!this.selection) {
-          console.error("Selection object is undefined!");
-          return;
-        }
-        if (target.checked) {
-          this.selection.tags.push(tag);
-        } else {
-          this.selection.tags = this.selection.tags.filter((t) => t !== tag);
-        }
-        this.updatePreview();
-      });
-      const label = tagItem.createEl("label", {
-        text: `#${tag}`,
-        attr: { for: `tag-${tag}` }
-      });
-      label.addClass("tag-label");
     });
   }
   createOptionsSection() {
@@ -2628,7 +2637,7 @@ var MindmapView = class extends import_obsidian4.ItemView {
     `;
     const generateButton = placeholder.querySelector("button");
     generateButton == null ? void 0 : generateButton.addEventListener("click", () => {
-      this.plugin.openSourceSelector();
+      this.plugin.openTagDrivenSourceSelector();
     });
   }
   renderMindmap() {
@@ -2775,7 +2784,7 @@ var MindmapView = class extends import_obsidian4.ItemView {
   async exportAsMarkdown() {
     if (!this.mindmapData)
       return;
-    const markdown = this.plugin.mindmapGenerator.convertToMarkdown(this.mindmapData);
+    const markdown = "# Tag-Driven Mindmap\nPlease use the tag-driven generator to create new mindmaps.";
     const fileName = `AI Mindmap Export - ${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.md`;
     try {
       await this.app.vault.create(fileName, markdown);
@@ -2991,7 +3000,7 @@ var VisualMindmapView = class extends import_obsidian5.ItemView {
     `;
     const generateButton = placeholder.querySelector("button");
     generateButton == null ? void 0 : generateButton.addEventListener("click", () => {
-      this.plugin.openSourceSelector();
+      this.plugin.openTagDrivenSourceSelector();
     });
   }
   async renderVisualMindmap() {
@@ -3525,7 +3534,7 @@ var VisualMindmapView = class extends import_obsidian5.ItemView {
   async exportAsMarkdown() {
     if (!this.mindmapData)
       return;
-    const markdown = this.plugin.mindmapGenerator.convertToMarkdown(this.mindmapData);
+    const markdown = "# Legacy Export Not Available\nPlease use the tag-driven generator.";
     const fileName = `AI-Mindmap-Export-${Date.now()}.md`;
     try {
       await this.app.vault.create(fileName, markdown);
@@ -4036,7 +4045,7 @@ var MindmapPreviewModal = class extends import_obsidian6.Modal {
 var DEFAULT_SETTINGS = {
   llmProvider: "claude",
   apiKey: "",
-  model: "claude-3-5-sonnet-latest",
+  model: "claude-sonnet-4-0",
   maxTokens: 4e3,
   includeContent: true,
   tagWeighting: "high",
@@ -4052,7 +4061,7 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
     await this.loadSettings();
     this.contentAggregator = new ContentAggregator(this.app);
     this.llmService = new LLMService(this.settings);
-    this.mindmapGenerator = new MindmapGenerator();
+    this.tagDrivenGenerator = new TagDrivenMindmapGenerator(this.settings);
     this.persistenceService = new MindmapPersistenceService(this.app, this, this.llmService);
     await this.persistenceService.initialize();
     this.registerView(
@@ -4064,7 +4073,7 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
       (leaf) => new VisualMindmapView(leaf, this)
     );
     const ribbonIconEl = this.addRibbonIcon("brain-circuit", "AI Mindmap Generator", (evt) => {
-      this.openSourceSelector();
+      this.openTagDrivenSourceSelector();
     });
     const combineRibbonEl = this.addRibbonIcon("link", "Combine Mindmaps", (evt) => {
       this.openMindmapCombiner();
@@ -4073,7 +4082,7 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
       id: "generate-mindmap-from-selection",
       name: "Generate mindmap from selected files",
       callback: () => {
-        this.openSourceSelector();
+        this.openTagDrivenSourceSelector();
       }
     });
     this.addCommand({
@@ -4116,10 +4125,11 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     this.llmService.updateSettings(this.settings);
+    this.tagDrivenGenerator.updateSettings(this.settings);
   }
-  openSourceSelector() {
+  openTagDrivenSourceSelector() {
     new SourceSelectorModal(this.app, this, (selection) => {
-      this.generateMindmapFromSelection(selection);
+      this.generateTagDrivenMindmapFromSelection(selection);
     }).open();
   }
   async generateFromCurrentNote(view) {
@@ -4139,7 +4149,7 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
       includeSubfolders: false,
       contentPreview: ""
     };
-    await this.generateMindmapFromSelection(selection);
+    await this.generateTagDrivenMindmapFromSelection(selection);
   }
   async openTagSelector() {
     new import_obsidian7.Notice("Tag selector coming in next version!");
@@ -4161,36 +4171,34 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
       new import_obsidian7.Notice(`Failed to open mindmap combiner: ${error.message}`);
     }
   }
-  async generateMindmapFromSelection(selection) {
+  async generateTagDrivenMindmapFromSelection(selection) {
     if (!this.settings.apiKey) {
       new import_obsidian7.Notice("Please configure your API key in settings first");
       return;
     }
     try {
-      new import_obsidian7.Notice("Analyzing content and generating mindmap...");
+      new import_obsidian7.Notice("Analyzing tag patterns and generating mindmap...");
       const processedContent = await this.contentAggregator.processSelection(selection);
       if (processedContent.length === 0) {
         new import_obsidian7.Notice("No content found in selection");
         return;
       }
-      const llmResponse = await this.llmService.generateMindmapStructure(
-        processedContent,
-        this.extractAllTags(processedContent)
-      );
-      if (!llmResponse.success) {
-        new import_obsidian7.Notice(`Failed to generate mindmap: ${llmResponse.error}`);
-        return;
+      console.log(`Processing ${processedContent.length} files for tag-driven analysis`);
+      const mindmapStructure = await this.tagDrivenGenerator.generateTagDrivenMindmap(processedContent);
+      const markdownContent = this.tagDrivenGenerator.generateMarkdownOutput(mindmapStructure);
+      const fileName = `Tag Analysis (${processedContent.length} files) - ${new Date().toLocaleDateString().replace(/\//g, "-")}.md`;
+      const folderPath = this.settings.mindmapsFolder;
+      await this.ensureFolderExists(folderPath);
+      const filePath = `${folderPath}/${fileName}`;
+      await this.app.vault.create(filePath, markdownContent);
+      const file = this.app.vault.getAbstractFileByPath(filePath);
+      if (file) {
+        const leaf = this.app.workspace.getLeaf();
+        await leaf.openFile(file);
       }
-      const mindmapStructure = await this.mindmapGenerator.buildStructure(
-        llmResponse.structure,
-        processedContent,
-        this.settings
-      );
-      const sourceFiles = processedContent.map((content) => content.filePath);
-      await this.displayMindmap(mindmapStructure, sourceFiles);
-      new import_obsidian7.Notice(`Mindmap generated successfully! (${processedContent.length} sources processed)`);
+      new import_obsidian7.Notice(`Tag-driven mindmap generated! (${processedContent.length} files analyzed)`);
     } catch (error) {
-      console.error("Error generating mindmap:", error);
+      console.error("Error generating tag-driven mindmap:", error);
       new import_obsidian7.Notice(`Error: ${error.message}`);
     }
   }
@@ -4201,22 +4209,6 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
       (_a = content.tags) == null ? void 0 : _a.forEach((tag) => allTags.add(tag));
     });
     return Array.from(allTags);
-  }
-  async displayMindmap(structure, sourceFiles = []) {
-    if (this.settings.outputFormat === "note" || this.settings.outputFormat === "both") {
-      await this.createMindmapNote(structure);
-    }
-    if (this.settings.outputFormat === "view" || this.settings.outputFormat === "both") {
-      await this.openVisualMindmapView(structure, sourceFiles);
-    }
-  }
-  async createMindmapNote(structure) {
-    const fileName = `AI Mindmap - ${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.md`;
-    const markdownContent = this.mindmapGenerator.convertToMarkdown(structure);
-    await this.app.vault.create(fileName, markdownContent);
-    if (this.settings.autoSave) {
-      new import_obsidian7.Notice(`Mindmap saved as: ${fileName}`);
-    }
   }
   async openVisualMindmapView(structure, sourceFiles = []) {
     const leaf = this.app.workspace.getLeaf(true);
@@ -4241,6 +4233,16 @@ var AIMindmapPlugin = class extends import_obsidian7.Plugin {
       this.app.workspace.revealLeaf(leaf);
     }
   }
+  async ensureFolderExists(folderPath) {
+    try {
+      const folder = this.app.vault.getAbstractFileByPath(folderPath);
+      if (!folder) {
+        await this.app.vault.createFolder(folderPath);
+      }
+    } catch (error) {
+      console.log(`Folder ${folderPath} already exists or was created`);
+    }
+  }
 };
 var AIMindmapSettingTab = class extends import_obsidian7.PluginSettingTab {
   constructor(app, plugin) {
@@ -4261,7 +4263,7 @@ var AIMindmapSettingTab = class extends import_obsidian7.PluginSettingTab {
       await this.plugin.saveSettings();
     }));
     if (this.plugin.settings.llmProvider === "claude") {
-      new import_obsidian7.Setting(containerEl).setName("Model").setDesc("Claude model to use for mindmap generation").addDropdown((dropdown) => dropdown.addOption("claude-3-5-sonnet-latest", "Claude 3.5 Sonnet (Latest)").addOption("claude-3-5-haiku-latest", "Claude 3.5 Haiku (Latest)").setValue(this.plugin.settings.model).onChange(async (value) => {
+      new import_obsidian7.Setting(containerEl).setName("Model").setDesc("Claude model to use for mindmap generation").addDropdown((dropdown) => dropdown.addOption("claude-sonnet-4-0", "Claude Sonnet 4.0 (Latest)").addOption("claude-3-5-haiku-latest", "Claude 3.5 Haiku (Latest)").setValue(this.plugin.settings.model).onChange(async (value) => {
         this.plugin.settings.model = value;
         await this.plugin.saveSettings();
       }));
